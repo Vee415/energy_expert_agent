@@ -43,11 +43,14 @@ User Query
 
 ## Key Features
 
-- **Table-aware chunking** — PDF tables are detected and kept intact instead of being fragmented across chunk boundaries
+- **LlamaParse extraction** — Vision-based PDF parsing that handles multi-column layouts, tables, and custom fonts (far superior to PyMuPDF for complex reports)
+- **Table-aware chunking** — Markdown tables detected and kept intact, narrative text split with markdown-aware separators
+- **Junk filtering** — Page headers, footers, and placeholder chunks filtered out during ingestion
+- **Year-based source filtering** — Queries mentioning a year (e.g. "market report 2024") automatically filter to the matching PDF
 - **Hybrid search** — Dense vector search + keyword boosting for years, regions, and energy-specific metrics
 - **Cross-encoder reranking** — ms-marco-MiniLM re-scores retrieved chunks for relevance
 - **3-signal uncertainty** — Not just a score, but an explainable breakdown of why the system is or isn't confident
-- **Dual LLM support** — Local inference with Ollama (gemma3:4b) or cloud with Claude API
+- **Dual LLM support** — Local inference with Ollama or cloud with Claude API
 
 ## Quick Start (Docker)
 
@@ -79,7 +82,7 @@ cp ~/Downloads/*.pdf data/documents/
 docker compose run ingest
 ```
 
-First run builds the image (~2-3 min, downloads Python deps + embedding models). Then it loads your PDFs, chunks them with table detection, embeds, and uploads to Qdrant.
+First run builds the image (~2-3 min, downloads Python deps + embedding models). Then it parses your PDFs with LlamaParse, chunks them with table detection, embeds, and uploads to Qdrant.
 
 ### 3. Start the app
 
@@ -191,35 +194,34 @@ python -m src.agent
 
 ```
 src/
-├── ingestion.py     # PDF loading, table-aware chunking, embedding, Qdrant upload
-├── retrieval.py     # Vector search, cross-encoder reranking, keyword boost
-├── agent.py          # RAG agent with Ollama/Claude support
+├── ingestion.py     # LlamaParse PDF extraction, table-aware chunking, embedding, Qdrant upload
+├── retrieval.py     # Vector search, cross-encoder reranking, keyword boost, source filtering
+├── agent.py          # RAG agent with Ollama/Claude support, year-based source filtering
 └── uncertainty.py    # 3-signal confidence scoring
 app.py                # Streamlit frontend
 ```
 
-## Table-Aware Chunking
+## PDF Extraction & Chunking
 
-PDF tables are a well-known RAG pain point. Standard splitters fragment tables across chunk boundaries, losing the structure the LLM needs.
+PDF extraction quality is the #1 factor in RAG answer quality. Standard PDF loaders (PyMuPDF, PyPDF) extract raw text streams that miss content on complex layouts — multi-column reports, sidebars, and custom fonts produce hollow chunks (titles, page numbers) instead of actual findings.
 
-This project uses a heuristic table detector that:
-1. Identifies tabular lines (tab-separated, pipe-separated, or column-aligned)
-2. Finds contiguous runs of tabular lines (requires 2+ consecutive)
-3. Keeps each table as a single chunk, regardless of size
-4. Marks chunks with `content_type: "table"` metadata
-5. Tags table chunks with `[TABLE]` in the LLM prompt so the model knows to extract structured data
+This project uses **LlamaParse** (vision-based OCR + layout understanding) which produces structured markdown output. Tables come out as proper pipe-delimited markdown, narrative text preserves heading structure, and page headers/footers are filtered out.
 
-Result: **197 table chunks** preserved intact out of 6,293 total chunks.
+Chunking strategy:
+- **Markdown-aware splitting** — breaks on headings (`##`, `###`) and paragraphs first
+- **Table preservation** — markdown tables detected and kept as whole chunks
+- **Junk filtering** — page headers (`"16 // ENTSO-E Market Report 2024"`), standalone headings, and placeholders removed
+- **Chunk size 1536** with 200-char overlap — large enough to carry complete findings
 
 ## Known Limitations
 
 Honest assessment — because shipping with known gaps is better than pretending they don't exist:
 
 - **Semantic search struggles with specific facts** — asking "Nordic mFRR volume 2021" retrieves the right document but the LLM paraphrases instead of quoting exact values
-- **Chart noise** — PDF-extracted chart data (axis labels, bar values) appears as garbled numeric sequences
+- **Chart/figure content** — LlamaParse extracts text but doesn't describe charts (requires vision mode, more credits)
 - **No BM25** — hybrid search uses keyword boosting, not proper sparse retrieval
 - **No citation verification** — the system doesn't validate that claims match source text
-- **Single-step retrieval** — no multi-hop reasoning or query expansion
+- **Single-step retrieval** — no multi-query expansion or multi-hop reasoning
 
 Full details in [CHALLENGES.md](CHALLENGES.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -227,6 +229,7 @@ Full details in [CHALLENGES.md](CHALLENGES.md) and [ARCHITECTURE.md](ARCHITECTUR
 
 | Component | Technology |
 |-----------|-----------|
+| PDF Parsing | LlamaParse (vision-based OCR + layout) |
 | Embeddings | sentence-transformers/all-MiniLM-L6-v2 (384-dim) |
 | Reranker | cross-encoder/ms-marco-MiniLM-L-6-v2 |
 | Vector DB | Qdrant (Docker) |
@@ -249,8 +252,8 @@ QDRANT_PORT=6333
 LLM_PROVIDER=ollama
 
 # Chunking
-CHUNK_SIZE=512
-CHUNK_OVERLAP=100
+CHUNK_SIZE=1536
+CHUNK_OVERLAP=200
 RETRIEVER_TOP_K=5
 ```
 
