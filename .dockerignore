@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.git/
+.claude/
+qdrant_storage/
+
+# PDFs are mounted at runtime, not baked into the image
+data/documents/*.pdf
+
+# Test and session files
+test_*.py
+SESSION*.md
+UPDATE.md
+ARCHITECTURE.md
+CHALLENGES.md
+PROJECT_GUIDE_DOC_AGENT.md
