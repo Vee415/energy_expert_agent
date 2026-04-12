@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, Match, SearchRequest
+from qdrant_client.models import Filter, FieldCondition, MatchValue, SearchRequest
 
 from src.ingestion import DocumentConfig
 
@@ -113,7 +113,7 @@ class Retriever:
                 must=[
                     FieldCondition(
                         key="source",
-                        match=Match(value=filter_source)
+                        match=MatchValue(value=filter_source)
                     )
                 ]
             )
@@ -209,8 +209,8 @@ class Retriever:
         top_k = top_k or self.top_k
         rerank_top_k = rerank_top_k or self.rerank_top_k
 
-        # Step 1: Vector search
-        search_k = top_k * 2 if use_hybrid else top_k
+        # Step 1: Vector search (fetch 3x candidates for better reranking)
+        search_k = top_k * 3
         results = self.search(query, top_k=search_k, filter_source=filter_source)
 
         if not results:
@@ -244,13 +244,16 @@ class Retriever:
         # Score each result
         for result in results:
             text_lower = result.text.lower()
+            source_lower = result.source.lower()
             keyword_matches = 0
 
-            # Check for year mentions
+            # Check for year mentions — and boost source filename match
             years = re.findall(r'\b(20\d{2})\b', query)
             for year in years:
                 if year in text_lower:
                     keyword_matches += 2  # Strong boost for year matches
+                if year in source_lower:
+                    keyword_matches += 3  # Strongest boost: year in filename
 
             # Check for region/organization keywords
             regions = ['nordic', 'european', 'germany', 'france', 'italy', 'spain', 'benelux']

@@ -46,7 +46,7 @@ class DocumentAgent:
         self,
         model_name: Optional[str] = None,
         temperature: float = 0.0,
-        top_k: int = 5,
+        top_k: int = 15,
         llm_provider: Optional[str] = None
     ):
         """Initialize the document agent.
@@ -67,13 +67,13 @@ class DocumentAgent:
         if model_name:
             self.model_name = model_name
         elif self.llm_provider == "anthropic":
-            self.model_name = "claude-3-haiku-20240307"
+            self.model_name = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307")
         else:
-            self.model_name = "gemma3:4b"
+            self.model_name = os.getenv("OLLAMA_MODEL", "gemma3:4b")
 
         # Initialize retriever
         logger.info("Initializing retriever...")
-        self.retriever = Retriever(top_k=top_k, rerank_top_k=top_k)
+        self.retriever = Retriever(top_k=top_k * 2, rerank_top_k=top_k)
 
         # Initialize LLM based on provider
         self._init_llm()
@@ -152,10 +152,39 @@ class DocumentAgent:
         Returns:
             AgentResponse with answer and metadata
         """
+        import re
         logger.info(f"Processing question: {question}")
 
-        # Step 1: Retrieve relevant context
-        retrieved_results = self.retriever.retrieve(question)
+        # Step 0: Detect year in query and pre-filter to matching sources
+        filter_source = None
+        years_in_query = re.findall(r'\b(20\d{2})\b', question)
+        if years_in_query:
+            year = years_in_query[0]
+            # Find PDFs whose filename contains that year
+            from pathlib import Path
+            docs_dir = Path("data/documents")
+            if docs_dir.exists():
+                matching = [f.name for f in docs_dir.glob("*.pdf") if year in f.name]
+                if matching:
+                    # If query also mentions a report type, narrow further
+                    q_lower = question.lower()
+                    type_keywords = {
+                        "market": "market", "balancing": "balancing",
+                        "regional": "regional", "implementation": "implementation",
+                        "monitoring": "monitoring", "coordination": "coordination",
+                    }
+                    for kw, match_str in type_keywords.items():
+                        if kw in q_lower:
+                            narrowed = [f for f in matching if match_str in f.lower()]
+                            if narrowed:
+                                matching = narrowed
+                                break
+                    # Use the most specific match
+                    filter_source = matching[0]
+                    logger.info(f"Year {year} detected — filtering to source: {filter_source}")
+
+        # Step 1: Retrieve relevant context (with optional source filter)
+        retrieved_results = self.retriever.retrieve(question, filter_source=filter_source)
         context = self.retriever.get_context_string(retrieved_results)
 
         # Get unique sources
@@ -190,6 +219,8 @@ class DocumentAgent:
         return f"""You are an expert assistant analyzing ENTSO-E energy market reports.
 Use ONLY the provided context to answer the question. If the context doesn't contain
 sufficient information, say "I don't have enough information to answer this question."
+
+Do NOT reference chunk IDs, scores, or internal metadata in your answer.
 
 Context from ENTSO-E reports:
 {'=' * 60}

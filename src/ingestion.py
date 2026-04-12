@@ -13,7 +13,7 @@ from datetime import datetime
 
 from pydantic import Field
 from pydantic_settings import BaseSettings
-from langchain_community.document_loaders import PyMuPDFLoader
+from llama_parse import LlamaParse
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
@@ -34,9 +34,13 @@ class DocumentConfig(BaseSettings):
     # Paths
     documents_dir: str = Field(default="data/documents", description="Directory containing PDF files")
 
+    # LlamaParse settings
+    llamaparse_api_key: str = Field(default="", description="LlamaParse API key")
+    llamaparse_result_type: str = Field(default="markdown", description="LlamaParse output format (markdown or text)")
+
     # Chunking settings
-    chunk_size: int = Field(default=512, description="Token size for each chunk")
-    chunk_overlap: int = Field(default=100, description="Overlap between chunks")
+    chunk_size: int = Field(default=1536, description="Token size for each chunk")
+    chunk_overlap: int = Field(default=200, description="Overlap between chunks")
 
     # Embedding settings
     embedding_model: str = Field(default="all-MiniLM-L6-v2", description="Sentence-transformers model name")
@@ -51,16 +55,17 @@ class DocumentConfig(BaseSettings):
     # Vector dimensions (depends on embedding model)
     vector_size: int = Field(default=384, description="Embedding vector dimension (384 for all-MiniLM-L6-v2)")
 
-    class Config:
-        env_file = ".env"
-        env_prefix = ""
+    model_config = {"env_file": ".env", "extra": "ignore"}
 
 
 def load_documents(config: DocumentConfig) -> List[Dict[str, Any]]:
-    """Load all PDF documents from the documents directory.
+    """Load all PDF documents using LlamaParse for high-quality extraction.
+
+    LlamaParse handles complex layouts, multi-column text, tables, and charts
+    far better than PyMuPDF — producing structured markdown output.
 
     Args:
-        config: DocumentConfig with documents_dir path
+        config: DocumentConfig with documents_dir path and LlamaParse settings
 
     Returns:
         List of document dictionaries with page_content and metadata
@@ -72,24 +77,43 @@ def load_documents(config: DocumentConfig) -> List[Dict[str, Any]]:
     pdf_files = list(docs_dir.glob("*.pdf"))
     logger.info(f"Found {len(pdf_files)} PDF files in {docs_dir}")
 
+    if not config.llamaparse_api_key:
+        raise ValueError(
+            "LLAMAPARSE_API_KEY is required. Get one at https://cloud.llamaindex.ai"
+        )
+
+    parser = LlamaParse(
+        api_key=config.llamaparse_api_key,
+        result_type=config.llamaparse_result_type,
+        verbose=True,
+        language="en",
+    )
+
     all_documents = []
 
     for pdf_path in pdf_files:
-        logger.info(f"Loading: {pdf_path.name}")
+        logger.info(f"Parsing with LlamaParse: {pdf_path.name}")
         try:
-            loader = PyMuPDFLoader(str(pdf_path))
-            documents = loader.load()
+            llama_docs = parser.load_data(str(pdf_path))
 
-            # Add source filename to metadata
-            for doc in documents:
-                doc.metadata["source"] = pdf_path.name
-                doc.metadata["file_path"] = str(pdf_path)
+            for doc in llama_docs:
+                # Convert LlamaParse Document to LangChain Document
+                text = doc.get_content() if hasattr(doc, 'get_content') else str(doc)
+                lc_doc = Document(
+                    page_content=text,
+                    metadata={
+                        **doc.metadata,
+                        "source": pdf_path.name,
+                        "file_path": str(pdf_path),
+                    }
+                )
+                all_documents.append(lc_doc)
 
-            all_documents.extend(documents)
-            logger.info(f"  Loaded {len(documents)} pages from {pdf_path.name}")
+            all_documents.extend([])
+            logger.info(f"  Parsed {len(llama_docs)} pages from {pdf_path.name}")
 
         except Exception as e:
-            logger.warning(f"  Failed to load {pdf_path.name}: {e}")
+            logger.warning(f"  Failed to parse {pdf_path.name}: {e}")
             continue
 
     logger.info(f"Total pages loaded: {len(all_documents)}")
@@ -265,17 +289,74 @@ def split_with_table_awareness(
     return chunks, chunk_id
 
 
+def _is_junk_chunk(text: str) -> bool:
+    """Check if a chunk is just a page header/footer with no real content.
+
+    Matches patterns like:
+    - "16 // ENTSO-E Market Report 2024"
+    - "# ENTSO-E Market Report 2024"
+    - "NO_CONTENT_HERE"
+    """
+    stripped = text.strip()
+    # Too short to be useful
+    if len(stripped) < 80:
+        # Page number patterns: "16 // ENTSO-E ..." or "203 // ..."
+        if re.match(r'^\d+\s*//', stripped):
+            return True
+        # Standalone heading with no body: "# Title"
+        if stripped.startswith('#') and '\n' not in stripped:
+            return True
+        # Placeholder text
+        if stripped == 'NO_CONTENT_HERE':
+            return True
+    return False
+
+
+def _is_markdown_table_block(lines: List[str], start: int) -> Tuple[bool, int]:
+    """Check if lines starting at `start` form a markdown table block.
+
+    Returns (is_table, end_index) — end_index is exclusive.
+    """
+    if start >= len(lines):
+        return False, start
+
+    line = lines[start].strip()
+    # Markdown tables start with | and have a separator row (|---|---|)
+    if not (line.startswith("|") and line.endswith("|")):
+        return False, start
+
+    # Check next line is separator row
+    if start + 1 < len(lines):
+        sep = lines[start + 1].strip()
+        if not (sep.startswith("|") and "---" in sep and sep.endswith("|")):
+            return False, start
+    else:
+        return False, start
+
+    # Consume all consecutive table rows
+    end = start + 2  # past header + separator
+    while end < len(lines):
+        row = lines[end].strip()
+        if row.startswith("|") and row.endswith("|"):
+            end += 1
+        else:
+            break
+
+    return True, end
+
+
 def chunk_documents(
     documents: List[Dict[str, Any]],
     config: DocumentConfig
 ) -> List[Dict[str, Any]]:
-    """Split documents into chunks, keeping tables intact.
+    """Split LlamaParse markdown documents into chunks, keeping tables intact.
 
-    Uses table-aware splitting: tables are detected and kept as whole chunks,
-    while narrative text is split using RecursiveCharacterTextSplitter.
+    LlamaParse returns structured markdown, so tables are already pipe-delimited.
+    This function detects markdown table blocks and keeps them whole, while
+    splitting narrative markdown with RecursiveCharacterTextSplitter.
 
     Args:
-        documents: List of loaded documents
+        documents: List of loaded documents (with markdown page_content)
         config: DocumentConfig with chunk_size and chunk_overlap
 
     Returns:
@@ -285,11 +366,12 @@ def chunk_documents(
     chunk_id = 0
     table_count = 0
 
-    # Create splitter once, reuse for all pages
+    # Markdown-aware splitter — splits on headings, paragraphs
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
         length_function=len,
+        separators=["\n\n## ", "\n\n### ", "\n\n", "\n", ". ", " "],
         is_separator_regex=False,
     )
 
@@ -300,28 +382,63 @@ def chunk_documents(
         line_count = doc.page_content.count("\n") + 1
         if idx < 5 or idx % 200 == 0:
             logger.info(f"  Chunking page {idx+1}/{len(documents)}: {source} p{page} ({page_len} chars, {line_count} lines)")
-        try:
-            doc_chunks, chunk_id = split_with_table_awareness(
-                page_text=doc.page_content,
-                page_metadata=doc.metadata,
-                text_splitter=text_splitter,
-                chunk_id_start=chunk_id,
-            )
-        except Exception as e:
-            logger.warning(f"  Table detection failed on {source} p{page}: {e}. Using narrative fallback.")
-            doc_chunks = []
-            for i, chunk_text in enumerate(text_splitter.split_text(doc.page_content)):
+
+        lines = doc.page_content.split("\n")
+        regions: List[Tuple[str, str]] = []  # (type, text)
+        i = 0
+        while i < len(lines):
+            is_table, end = _is_markdown_table_block(lines, i)
+            if is_table:
+                table_text = "\n".join(lines[i:end]).strip()
+                if table_text:
+                    regions.append(("table", table_text))
+                i = end
+            else:
+                # Accumulate narrative lines until next table or end
+                narrative_start = i
+                while i < len(lines):
+                    is_tbl, _ = _is_markdown_table_block(lines, i)
+                    if is_tbl:
+                        break
+                    i += 1
+                narrative_text = "\n".join(lines[narrative_start:i]).strip()
+                if narrative_text:
+                    regions.append(("narrative", narrative_text))
+
+        # Convert regions to chunks (skip junk)
+        doc_chunks = []
+        for content_type, text in regions:
+            if _is_junk_chunk(text):
+                continue
+            if content_type == "table":
                 doc_chunks.append({
-                    "text": chunk_text,
+                    "text": text,
                     "metadata": {
                         **doc.metadata,
                         "chunk_id": chunk_id,
-                        "chunk_index": i,
-                        "total_chunks_in_region": 0,
-                        "content_type": "narrative",
+                        "chunk_index": 0,
+                        "total_chunks_in_region": 1,
+                        "content_type": "table",
                     }
                 })
                 chunk_id += 1
+            else:
+                sub_chunks = text_splitter.split_text(text)
+                for ci, chunk_text in enumerate(sub_chunks):
+                    if _is_junk_chunk(chunk_text):
+                        continue
+                    doc_chunks.append({
+                        "text": chunk_text,
+                        "metadata": {
+                            **doc.metadata,
+                            "chunk_id": chunk_id,
+                            "chunk_index": ci,
+                            "total_chunks_in_region": len(sub_chunks),
+                            "content_type": "narrative",
+                        }
+                    })
+                    chunk_id += 1
+
         table_count += sum(1 for c in doc_chunks if c["metadata"].get("content_type") == "table")
         chunks.extend(doc_chunks)
 
@@ -369,13 +486,15 @@ def create_embeddings(
 
 def ingest_to_qdrant(
     chunks: List[Dict[str, Any]],
-    config: DocumentConfig
+    config: DocumentConfig,
+    reset: bool = False
 ) -> Dict[str, Any]:
     """Upload chunks with embeddings to Qdrant vector database.
 
     Args:
         chunks: List of chunks with embeddings
         config: DocumentConfig with Qdrant connection details
+        reset: If True, delete and recreate the collection (wipe old data)
 
     Returns:
         Dictionary with ingestion summary
@@ -383,11 +502,20 @@ def ingest_to_qdrant(
     logger.info(f"Connecting to Qdrant at {config.qdrant_host}:{config.qdrant_port}")
     client = QdrantClient(host=config.qdrant_host, port=config.qdrant_port)
 
-    # Check if collection exists, create if not
+    # Check if collection exists
     collections = client.get_collections().collections
     collection_names = [c.name for c in collections]
 
-    if config.collection_name not in collection_names:
+    if config.collection_name in collection_names:
+        if reset:
+            logger.info(f"Resetting collection: {config.collection_name}")
+            client.delete_collection(collection_name=config.collection_name)
+            logger.info("Old collection deleted")
+        else:
+            logger.info(f"Using existing collection: {config.collection_name}")
+
+    # Create collection if needed
+    if config.collection_name not in [c.name for c in client.get_collections().collections]:
         logger.info(f"Creating collection: {config.collection_name}")
         client.create_collection(
             collection_name=config.collection_name,
@@ -396,8 +524,6 @@ def ingest_to_qdrant(
                 distance=Distance.COSINE
             )
         )
-    else:
-        logger.info(f"Using existing collection: {config.collection_name}")
 
     # Prepare points for upload
     points = []
@@ -469,9 +595,9 @@ def run_ingestion() -> Dict[str, Any]:
     logger.info("\n[3/4] Creating embeddings...")
     chunks = create_embeddings(chunks, config)
 
-    # Step 4: Ingest to Qdrant
+    # Step 4: Ingest to Qdrant (reset=True to wipe old PyMuPDF data)
     logger.info("\n[4/4] Ingesting to Qdrant...")
-    result = ingest_to_qdrant(chunks, config)
+    result = ingest_to_qdrant(chunks, config, reset=True)
 
     # Summary
     duration = (datetime.now() - start_time).total_seconds()
