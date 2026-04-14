@@ -220,7 +220,9 @@ class DocumentAgent:
 Use ONLY the provided context to answer the question. If the context doesn't contain
 sufficient information, say "I don't have enough information to answer this question."
 
-Do NOT reference chunk IDs, scores, or internal metadata in your answer.
+Cite sources naturally at the end of your answer, not inline after every sentence.
+Reference the document name and year only (e.g., "Sources: ENTSO-E Market Report 2023, Balancing Report 2024").
+Do NOT reference chunk IDs, bracket numbers, scores, or internal metadata.
 
 Context from ENTSO-E reports:
 {'=' * 60}
@@ -229,9 +231,10 @@ Context from ENTSO-E reports:
 
 Question: {question}
 
-Provide a clear, accurate answer based on the context above. Include specific details
-from the reports when possible. If the context contains conflicting information,
-acknowledge it.
+Provide a clear, accurate answer based on the context above. Write in a natural,
+flowing style. Include specific details and numbers from the reports when possible.
+If the context contains conflicting information, acknowledge it.
+List your sources by document name and year at the end of your answer.
 
 When context chunks are marked [TABLE], read them as structured data — extract specific
 values, compare across rows/columns, and reference exact numbers when answering factual

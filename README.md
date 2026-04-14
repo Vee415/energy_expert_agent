@@ -2,6 +2,8 @@
 
 RAG-powered Q&A system over European energy market reports with **3-signal uncertainty quantification** — so you know when to trust the answer and when not to.
 
+![Demo](Demo.gif)
+
 ## Why This Project Exists
 
 Standard RAG systems give you an answer and hope for the best. This one tells you **how confident it is** using three independent signals:

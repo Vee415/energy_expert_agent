@@ -301,7 +301,7 @@ class Retriever:
 
             if include_metadata:
                 context_parts.append(
-                    f"[{i}] Source: {result.source}, Chunk: {result.chunk_id}, Score: {result.score:.3f}{type_label}\n{result.text}"
+                    f"[{i}] Source: {result.source}{type_label}\n{result.text}"
                 )
             else:
                 context_parts.append(f"[{i}]{type_label} {result.text}")
